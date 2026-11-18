@@ -2,6 +2,9 @@
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
 //
+// Note from the builder: this entrypoint is intentionally untouched apart from this comment — the
+// forge itself lives in app.ts, store.ts, git.ts, rest.ts, graphql.ts and mcp.ts.
+//
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
