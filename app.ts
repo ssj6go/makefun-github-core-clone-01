@@ -19,6 +19,7 @@ import {
   hashObject,
   parseCommit,
   parseTag,
+  parseTree,
   pktDelim,
   pktFlush,
   readPack,
@@ -139,7 +140,7 @@ function v2Advertisement(): Buffer {
   return Buffer.concat([
     encodePktLine('version 2\n'),
     encodePktLine(`agent=${AGENT}\n`),
-    encodePktLine('ls-refs=unborn\n'),
+    encodePktLine('ls-refs\n'),
     encodePktLine('fetch=shallow\n'),
     encodePktLine('server-option\n'),
     encodePktLine('object-format=sha1\n'),
@@ -193,7 +194,9 @@ interface FetchPlan {
 /**
  * Plan a fetch: which objects the client still needs, which commits become
  * the new shallow boundary, and the acknowledgement lines. `depth` is null
- * for a full fetch.
+ * for a full fetch. `prevShallow` names the client's current shallow
+ * boundary commits: the client has those commits but not their parents, so
+ * the "already have" set stops there.
  */
 function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: string[], depth: number | null): FetchPlan {
   const lookup = (oid: string): GitObject | undefined => repo.getObject(oid);
@@ -209,9 +212,31 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
     if (depth !== null && gen + 1 >= depth) continue;
     for (const parent of parseCommit(object.data).parents) queue.push({ oid: parent, depth: gen + 1 });
   }
-  const haveObjects = collectReachable(lookup, haves);
-  const sendCommits = [...generation.keys()].filter((oid) => !haveObjects.has(oid));
-  const sendObjects = collectReachable(lookup, sendCommits);
+  const stopAt = new Set(prevShallow);
+  const haveObjects = collectReachable(lookup, haves, stopAt);
+  const sendCommitSet = new Set([...generation.keys()].filter((oid) => !haveObjects.has(oid)));
+  // Objects reachable from the commits being sent, without following a
+  // parent link out of the sent set (that history stays behind the depth).
+  // Non-commit wants (annotated tags) are seeded too: a tag object is not
+  // reachable from any commit, but the client asked for it by name.
+  const sendObjects = new Set<string>();
+  const stack = [...sendCommitSet, ...wants.filter((oid) => lookup(oid) !== undefined)];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (sendObjects.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) continue;
+    sendObjects.add(oid);
+    if (object.type === 'commit') {
+      const view = parseCommit(object.data);
+      stack.push(view.tree);
+      for (const parent of view.parents) if (sendCommitSet.has(parent)) stack.push(parent);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+    } else if (object.type === 'tag') {
+      stack.push(parseTag(object.data).object);
+    }
+  }
   const objects: GitObject[] = [];
   for (const oid of sendObjects) {
     if (haveObjects.has(oid)) continue;
@@ -227,22 +252,21 @@ function planFetch(repo: Repo, wants: string[], haves: string[], prevShallow: st
   const shallow: string[] = [];
   const unshallow: string[] = [];
   if (depth !== null) {
-    for (const oid of sendCommits) {
+    for (const oid of sendCommitSet) {
       const gen = generation.get(oid)!;
       if (gen !== depth - 1) continue;
       const object = lookup(oid);
       if (!object || object.type !== 'commit') continue;
       const parents = parseCommit(object.data).parents;
-      const hasParentBeyond = parents.some((p) => lookup(p) !== undefined && !sendCommits.includes(p) && !haveObjects.has(p));
+      const hasParentBeyond = parents.some((p) => lookup(p) !== undefined && !sendCommitSet.has(p) && !haveObjects.has(p));
       if (parents.length > 0 && hasParentBeyond) shallow.push(oid);
     }
   }
   for (const prev of prevShallow) {
-    if (!sendCommits.includes(prev)) continue;
     const object = lookup(prev);
     if (!object || object.type !== 'commit') continue;
     const parents = parseCommit(object.data).parents;
-    const resolved = parents.every((p) => lookup(p) === undefined || sendCommits.includes(p) || haveObjects.has(p));
+    const resolved = parents.every((p) => lookup(p) === undefined || sendCommitSet.has(p) || haveObjects.has(p));
     if (resolved) unshallow.push(prev);
   }
 
@@ -273,7 +297,8 @@ function lsRefsV2(repo: Repo, lines: string[]): Buffer {
   let symrefs = false;
   let unborn = false;
   const prefixes: string[] = [];
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.trim();
     if (line === 'peel') peel = true;
     else if (line === 'symrefs') symrefs = true;
     else if (line === 'unborn') unborn = true;
@@ -283,7 +308,14 @@ function lsRefsV2(repo: Repo, lines: string[]): Buffer {
   const parts: Buffer[] = [];
   const tip = repo.defaultTip;
   if (tip === undefined) {
-    if (unborn && keep('HEAD')) {
+    // No refs yet: HEAD is unborn. Emit the zero-oid HEAD line (with its
+    // symref target) so clones learn the default branch, and only add the
+    // `unborn <ref>` line when the client explicitly asked for it.
+    if (keep('HEAD')) {
+      const attrs = symrefs ? ` symref-target:refs/heads/${repo.defaultBranch}` : '';
+      parts.push(encodePktLine(`${ZERO_OID} HEAD${attrs}\n`));
+    }
+    if (unborn && keep(`refs/heads/${repo.defaultBranch}`)) {
       parts.push(encodePktLine(`unborn refs/heads/${repo.defaultBranch} symref-target:refs/heads/${repo.defaultBranch}\n`));
     }
   } else {
@@ -447,7 +479,31 @@ function handleReceivePack(req: IncomingMessage, res: ServerResponse, owner: str
         continue;
       }
       const newObject = repo.getObject(command.newOid);
-      if (!newObject || newObject.type !== 'commit') {
+      if (!newObject) {
+        report.push({ ref: command.ref, ok: false, reason: 'object not found' });
+        continue;
+      }
+      if (command.ref.startsWith('refs/tags/')) {
+        // Tag refs point at tag (or commit) objects; only the old value
+        // must match — no fast-forward rule applies to tags.
+        if (current === undefined) {
+          if (command.oldOid !== ZERO_OID) {
+            report.push({ ref: command.ref, ok: false, reason: 'old value does not match' });
+            continue;
+          }
+          repo.refs.set(command.ref, command.newOid);
+          report.push({ ref: command.ref, ok: true, reason: '' });
+          continue;
+        }
+        if (command.oldOid !== current) {
+          report.push({ ref: command.ref, ok: false, reason: 'old value does not match' });
+          continue;
+        }
+        repo.refs.set(command.ref, command.newOid);
+        report.push({ ref: command.ref, ok: true, reason: '' });
+        continue;
+      }
+      if (newObject.type !== 'commit') {
         report.push({ ref: command.ref, ok: false, reason: 'object not found' });
         continue;
       }

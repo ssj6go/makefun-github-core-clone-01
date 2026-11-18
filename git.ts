@@ -104,10 +104,12 @@ export function pktLinesToText(packets: readonly GitPacket[]): string[] {
 // ---------------------------------------------------------------------------
 
 class BitReader {
+  private readonly buf: Buffer;
   private pos: number;
   private bit = 0;
 
-  constructor(private readonly buf: Buffer, start: number) {
+  constructor(buf: Buffer, start: number) {
+    this.buf = buf;
     this.pos = start;
   }
 
@@ -572,9 +574,11 @@ export function parseTag(data: Buffer): { object: string; type: string; tag: str
 
 /**
  * All object ids reachable from `tips` (commits, their trees and blobs, tags
- * and their targets), following only objects present in `lookup`.
+ * and their targets), following only objects present in `lookup`. When
+ * `stopAt` names commits, their parents are not followed: the caller has
+ * those commits but not their history (a shallow boundary).
  */
-export function collectReachable(lookup: ObjectLookup, tips: Iterable<string>): Set<string> {
+export function collectReachable(lookup: ObjectLookup, tips: Iterable<string>, stopAt: ReadonlySet<string> = new Set()): Set<string> {
   const seen = new Set<string>();
   const queue: string[] = [...tips];
   while (queue.length > 0) {
@@ -586,7 +590,7 @@ export function collectReachable(lookup: ObjectLookup, tips: Iterable<string>): 
     if (object.type === 'commit') {
       const view = parseCommit(object.data);
       queue.push(view.tree);
-      for (const parent of view.parents) queue.push(parent);
+      if (!stopAt.has(oid)) for (const parent of view.parents) queue.push(parent);
     } else if (object.type === 'tree') {
       for (const entry of parseTree(object.data)) queue.push(entry.oid);
     } else if (object.type === 'tag') {

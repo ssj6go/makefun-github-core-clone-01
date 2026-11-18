@@ -117,8 +117,11 @@ function tokenize(source: string): Token[] {
 
 class Parser {
   private pos = 0;
+  private readonly tokens: Token[];
 
-  constructor(private readonly tokens: Token[]) {}
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
 
   peek(): Token | undefined {
     return this.tokens[this.pos];
@@ -585,6 +588,30 @@ function resolveField(node: GqlNode, field: GqlField, ctx: Ctx): unknown {
       if (field.name === 'additions') return node.additions;
       if (field.name === 'deletions') return node.deletions;
       if (field.name === 'changeType') return node.changeType;
+      break;
+    }
+    case 'CreateIssuePayload':
+    case 'CloseIssuePayload': {
+      if (field.name === 'issue') return node.issue;
+      break;
+    }
+    case 'CreatePullRequestPayload':
+    case 'MergePullRequestPayload': {
+      if (field.name === 'pullRequest') return node.pullRequest;
+      break;
+    }
+    case 'AddCommentPayload': {
+      if (field.name === 'commentEdge') return node.commentEdge;
+      break;
+    }
+    case 'IssueCommentEdge': {
+      if (field.name === 'node') return node.node;
+      if (field.name === 'cursor') return node.cursor;
+      break;
+    }
+    case 'IssueComment': {
+      if (field.name === 'id') return node.id;
+      if (field.name === 'body') return node.body;
       break;
     }
     case '__Type': {
